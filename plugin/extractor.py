@@ -25,6 +25,45 @@ def sanitize_filename(title: str, ext: str) -> str:
 # Format selection
 # ---------------------------------------------------------------------------
 
+def format_resolution_label(f):
+    vcodec = str(f.get("vcodec", "none")).lower()
+    if vcodec in ["none", ""]:
+        return None
+    note = str(f.get("format_note", "")).lower()
+    if "storyboard" in note:
+        return None
+
+    h = 0
+    try:
+        h = int(f.get("height") or 0)
+    except (ValueError, TypeError):
+        h = 0
+
+    w = 0
+    try:
+        w = int(f.get("width") or 0)
+    except (ValueError, TypeError):
+        w = 0
+
+    if "2160" in note or "4k" in note or h >= 2160 or w >= 3840:
+        return "4K"
+    if "1440" in note or "2k" in note or h >= 1440 or w >= 2560:
+        return "1440p"
+    if "1080" in note or h >= 1080 or w >= 1920:
+        return "1080p"
+    if "720" in note or h >= 720 or w >= 1280:
+        return "720p"
+    if "480" in note or h >= 480 or w >= 854:
+        return "480p"
+    if "360" in note or h >= 360 or w >= 640:
+        return "360p"
+    if "240" in note or h >= 240 or w >= 426:
+        return "240p"
+    if "144" in note or (0 < h < 240) or (0 < w < 426):
+        return "144p"
+    return None
+
+
 def process_single_media(data, resolution: str):
     title = data.get("title", "Video")
     thumbnail = data.get("thumbnail", "")
@@ -73,7 +112,10 @@ def process_single_media(data, resolution: str):
 
         if not chosen_format:
             with_audio = [f for f in direct_formats if str(f.get("acodec", "none")).lower() not in ["none", ""]]
-            chosen_format = with_audio[-1] if with_audio else direct_formats[0]
+            chosen_format = with_audio[-1] if with_audio else None
+
+        if not chosen_format:
+            return None, None, None, None, None
 
         ext = str(chosen_format.get("ext", "")).lower()
         if ext in ["mp4", "m4a"]:
@@ -85,12 +127,6 @@ def process_single_media(data, resolution: str):
         else:
             chosen_ext = ext or "m4a"
     else:
-        requested_height = None
-        for h in [2160, 1440, 1080, 720, 480, 360, 240, 144]:
-            if str(h) in resolution:
-                requested_height = h
-                break
-
         video_formats = []
         for f in direct_formats:
             vcodec = str(f.get("vcodec", "none")).lower()
@@ -113,20 +149,7 @@ def process_single_media(data, resolution: str):
             except (ValueError, TypeError):
                 return 0.0
 
-        if requested_height:
-            under_or_equal = [f for f in video_formats if parse_height(f) <= requested_height]
-            pool = under_or_equal if under_or_equal else video_formats
-
-            def height_sort_key(f):
-                h = parse_height(f)
-                has_audio = 1 if str(f.get("acodec", "none")).lower() not in ["none", ""] else 0
-                is_mp4 = 1 if str(f.get("ext", "")).lower() == "mp4" else 0
-                bitrate = parse_bitrate(f)
-                return (h, has_audio, is_mp4, bitrate)
-
-            pool.sort(key=height_sort_key, reverse=True)
-            chosen_format = pool[0]
-        else:
+        if resolution == "Best Quality":
             def best_sort_key(f):
                 h = parse_height(f)
                 is_mp4 = 1 if str(f.get("ext", "")).lower() == "mp4" else 0
@@ -135,7 +158,25 @@ def process_single_media(data, resolution: str):
                 return (h, is_mp4, has_audio, bitrate)
 
             video_formats.sort(key=best_sort_key, reverse=True)
-            chosen_format = video_formats[0]
+            chosen_format = video_formats[0] if video_formats else None
+        else:
+            # Strictly match requested resolution tier
+            matching_formats = [f for f in video_formats if format_resolution_label(f) == resolution]
+            if not matching_formats:
+                return None, None, None, None, None
+
+            def tier_sort_key(f):
+                h = parse_height(f)
+                is_mp4 = 1 if str(f.get("ext", "")).lower() == "mp4" else 0
+                has_audio = 1 if str(f.get("acodec", "none")).lower() not in ["none", ""] else 0
+                bitrate = parse_bitrate(f)
+                return (h, is_mp4, has_audio, bitrate)
+
+            matching_formats.sort(key=tier_sort_key, reverse=True)
+            chosen_format = matching_formats[0]
+
+        if not chosen_format:
+            return None, None, None, None, None
 
         ext = str(chosen_format.get("ext", "")).lower()
         chosen_ext = ext if ext else "mp4"
@@ -282,7 +323,7 @@ def extract_media(url: str, default_resolution: str = "Best Quality"):
         print(json.dumps({"type": "header", "total": len(urls_to_fetch), "playlist_title": final_title}), flush=True)
 
     parsed_items = []
-    resolutions_to_check = ["Best Quality", "4K", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p", "Audio Only"]
+    resolutions_to_check = ["4K", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p", "Audio Only"]
 
     def fetch_single(vid_url):
         single_cmd = cmd.copy()
@@ -315,6 +356,7 @@ def extract_media(url: str, default_resolution: str = "Best Quality"):
                 best_url = None
                 best_audio_url = None
                 best_ext = "mp4"
+                best_res = None
                 item_title = "Video"
                 item_thumb = ""
 
@@ -322,12 +364,18 @@ def extract_media(url: str, default_resolution: str = "Best Quality"):
                     media_url, audio_url, ext, title, thumb = process_single_media(data, res)
                     if media_url:
                         item_formats[res] = media_url
-                        if res == default_resolution or (best_url is None):
+                        if res == default_resolution or (best_url is None and res != "Audio Only"):
                             best_url = media_url
                             best_audio_url = audio_url
                             best_ext = ext
+                            best_res = res
                             item_title = title
                             item_thumb = thumb
+
+                if not best_url and "Audio Only" in item_formats:
+                    best_url = item_formats["Audio Only"]
+                    best_res = "Audio Only"
+                    best_ext = "m4a"
 
                 if best_url:
                     if is_playlist_mode:
@@ -337,6 +385,7 @@ def extract_media(url: str, default_resolution: str = "Best Quality"):
                             "title": item_title,
                             "url": best_url,
                             "ext": best_ext,
+                            "resolution": best_res,
                             "formats": item_formats,
                             "thumbnail": item_thumb
                         }
@@ -348,6 +397,7 @@ def extract_media(url: str, default_resolution: str = "Best Quality"):
                             "title": item_title,
                             "url": best_url,
                             "ext": best_ext,
+                            "resolution": best_res,
                             "formats": item_formats,
                             "thumbnail": item_thumb
                         }
