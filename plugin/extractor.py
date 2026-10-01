@@ -206,15 +206,23 @@ def process_single_media(data, resolution: str):
 # Build yt-dlp command
 # ---------------------------------------------------------------------------
 
-# YouTube PoToken workaround: use the Android client which bypasses the
-# Proof-of-Origin (PoToken) gate that blocks web/ios clients for unauthenticated
-# users. Confirmed working with yt-dlp 2026.08.x on macOS without cookies.
-_YOUTUBE_EXTRACTOR_ARGS = [
-    "--extractor-args", "youtube:player_client=default,android",
+# Resilient YouTube player client strategy:
+# Start with android and web client fallbacks.
+# If PoToken or bot challenges occur, fallback strategy will switch client tiers.
+_DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+_YOUTUBE_PRIMARY_EXTRACTOR_ARGS = [
+    "--extractor-args", "youtube:player_client=default,web,ios",
 ]
 
+_YOUTUBE_FALLBACK_EXTRACTOR_ARGS = [
+    "--extractor-args", "youtube:player_client=tv,mweb",
+]
 
-def _build_cmd(url: str) -> list:
+def _is_youtube(url: str) -> bool:
+    return bool(re.search(r"(youtube\.com|youtu\.be)", url, re.I))
+
+def _build_cmd(url: str, fallback_client: bool = False, no_playlist: bool = False) -> list:
     """Return the base yt-dlp command list for fetching full JSON info.
 
     uv run (called from run.sh) installs yt-dlp into the venv declared in
@@ -225,13 +233,23 @@ def _build_cmd(url: str) -> list:
         "--no-warnings",
         "-q",
         "--dump-json",
-        "--yes-playlist",
+        "--socket-timeout", "30",
+        "--retries", "5",
+        "--fragment-retries", "5",
+        "--extractor-retries", "3",
+        "--no-check-certificates",
+        "--geo-bypass",
+        "--user-agent", _DEFAULT_USER_AGENT,
     ]
 
-    # YouTube PoToken workaround: android client bypasses the sign-in gate
+    if no_playlist:
+        base_flags.append("--no-playlist")
+    else:
+        base_flags.append("--yes-playlist")
+
     yt_flags = []
-    if re.search(r"(youtube\.com|youtu\.be)", url, re.I):
-        yt_flags = _YOUTUBE_EXTRACTOR_ARGS
+    if _is_youtube(url):
+        yt_flags = _YOUTUBE_FALLBACK_EXTRACTOR_ARGS if fallback_client else _YOUTUBE_PRIMARY_EXTRACTOR_ARGS
 
     return [sys.executable, "-m", "yt_dlp"] + base_flags + yt_flags + ["--", url]
 
@@ -244,13 +262,17 @@ def _build_flat_cmd(cmd: list) -> list:
     if "--dump-json" in flat_cmd:
         flat_cmd.remove("--dump-json")
 
-    # Replace --yes-playlist with --flat-playlist
+    # Replace --yes-playlist or --no-playlist with --flat-playlist
     if "--yes-playlist" in flat_cmd:
         idx = flat_cmd.index("--yes-playlist")
         flat_cmd[idx] = "--flat-playlist"
+    elif "--no-playlist" in flat_cmd:
+        idx = flat_cmd.index("--no-playlist")
+        flat_cmd[idx] = "--flat-playlist"
+    else:
+        flat_cmd.append("--flat-playlist")
 
     # Insert --dump-single-json immediately before the "--" URL separator
-    # Correct order: ... --flat-playlist --dump-single-json -- <url>
     if "--" in flat_cmd:
         sep_idx = flat_cmd.index("--")
         flat_cmd.insert(sep_idx, "--dump-single-json")
@@ -264,20 +286,113 @@ def _build_flat_cmd(cmd: list) -> list:
 # Main extraction logic
 # ---------------------------------------------------------------------------
 
-def extract_media(url: str, default_resolution: str = "Best Quality"):
-    cmd = _build_cmd(url)
-    flat_cmd = _build_flat_cmd(cmd)
-
-    import concurrent.futures
-
+def _run_proc(cmd_list, timeout=60):
     try:
-        proc = subprocess.Popen(flat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        stdout, stderr = proc.communicate(timeout=60)
+        proc = subprocess.Popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return proc.returncode, stdout, stderr
     except subprocess.TimeoutExpired:
         proc.kill()
-        return {"status": "error", "message": "yt-dlp timed out while fetching playlist info"}
+        return -1, "", "yt-dlp timed out"
     except Exception as e:
-        return {"status": "error", "message": f"Failed to execute yt-dlp: {str(e)}"}
+        return -1, "", str(e)
+
+
+def extract_media(url: str, default_resolution: str = "Best Quality"):
+    import concurrent.futures
+
+    resolutions_to_check = ["4K", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p", "Audio Only"]
+    is_yt = _is_youtube(url)
+    is_likely_playlist = bool(re.search(r"([&?]list=|\/playlist|\/channel\/|\/user\/|\/c\/|@.*\/videos)", url, re.I))
+
+    # Fast path for single videos: avoid double-invocation of yt-dlp by querying directly
+    if not is_likely_playlist:
+        direct_cmd = _build_cmd(url, fallback_client=False, no_playlist=True)
+        rc, stdout, stderr = _run_proc(direct_cmd, timeout=60)
+
+        # Retry with fallback client if YouTube challenged the player client
+        if rc != 0 and is_yt:
+            fallback_cmd = _build_cmd(url, fallback_client=True, no_playlist=True)
+            rc, stdout, stderr = _run_proc(fallback_cmd, timeout=60)
+
+        if rc == 0 and stdout and stdout.strip():
+            # Check if this returned a single video or if it's secretly a multi-entry playlist
+            for line in stdout.splitlines():
+                line = line.strip()
+                if not line or not line.startswith('{'):
+                    continue
+                try:
+                    data = json.loads(line)
+                    if data.get("_type") != "playlist":
+                        # Direct single video extraction succeeded!
+                        item_formats = {}
+                        audio_formats = {}
+                        best_url = None
+                        best_audio_url = None
+                        best_ext = "mp4"
+                        best_res = None
+                        item_title = data.get("title", "Video")
+                        item_thumb = data.get("thumbnail", "")
+                        http_headers = data.get("http_headers") or {}
+
+                        for res in resolutions_to_check:
+                            media_url, audio_url, ext, title, thumb = process_single_media(data, res)
+                            if media_url:
+                                item_formats[res] = media_url
+                                if audio_url:
+                                    audio_formats[res] = audio_url
+                                if res == default_resolution or (best_url is None and res != "Audio Only"):
+                                    best_url = media_url
+                                    best_audio_url = audio_url
+                                    best_ext = ext
+                                    best_res = res
+                                    item_title = title
+                                    item_thumb = thumb
+
+                        if not best_url and "Audio Only" in item_formats:
+                            best_url = item_formats["Audio Only"]
+                            best_res = "Audio Only"
+                            best_ext = "m4a"
+
+                        if best_url:
+                            playlist_item = {
+                                "title": item_title,
+                                "url": best_url,
+                                "ext": best_ext,
+                                "resolution": best_res,
+                                "formats": item_formats,
+                                "audioFormats": audio_formats,
+                                "thumbnail": item_thumb,
+                                "httpHeaders": http_headers
+                            }
+                            if best_audio_url:
+                                playlist_item["audioUrl"] = best_audio_url
+
+                            return {
+                                "status": "success",
+                                "title": playlist_item["title"],
+                                "url": best_url,
+                                "audioUrl": best_audio_url,
+                                "ext": best_ext,
+                                "resolution": best_res,
+                                "formats": item_formats,
+                                "audioFormats": audio_formats,
+                                "thumbnail": item_thumb,
+                                "httpHeaders": http_headers,
+                                "playlist": [playlist_item]
+                            }
+                except Exception:
+                    pass
+
+    # Playlist or fallback path
+    cmd = _build_cmd(url, fallback_client=False, no_playlist=False)
+    flat_cmd = _build_flat_cmd(cmd)
+
+    rc, stdout, stderr = _run_proc(flat_cmd, timeout=60)
+    if rc != 0 and is_yt:
+        cmd = _build_cmd(url, fallback_client=True, no_playlist=False)
+        flat_cmd = _build_flat_cmd(cmd)
+        rc, stdout, stderr = _run_proc(flat_cmd, timeout=60)
 
     if not stdout or not stdout.strip():
         err_msg = stderr.strip() if stderr else "No output from yt-dlp"
@@ -292,20 +407,15 @@ def extract_media(url: str, default_resolution: str = "Best Quality"):
             continue
         try:
             metadata = json.loads(line)
-
             if not playlist_title and metadata.get("playlist_title"):
                 playlist_title = metadata.get("playlist_title")
 
             if metadata.get("_type") == "playlist":
                 for entry in metadata.get("entries", []):
-                    # Prefer webpage_url (proper watch URL) over raw CDN url
                     u = entry.get("webpage_url") or entry.get("url")
                     if u:
                         urls_to_fetch.append(u)
             else:
-                # For single videos: webpage_url is the canonical watch URL.
-                # metadata.get("url") may be a signed CDN stream URL that
-                # yt-dlp cannot re-fetch info for.
                 u = metadata.get("webpage_url") or metadata.get("url")
                 if u:
                     urls_to_fetch.append(u)
@@ -323,28 +433,25 @@ def extract_media(url: str, default_resolution: str = "Best Quality"):
         print(json.dumps({"type": "header", "total": len(urls_to_fetch), "playlist_title": final_title}), flush=True)
 
     parsed_items = []
-    resolutions_to_check = ["4K", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p", "Audio Only"]
 
     def fetch_single(vid_url):
         single_cmd = cmd.copy()
         if "--yes-playlist" in single_cmd:
             single_cmd[single_cmd.index("--yes-playlist")] = "--no-playlist"
-        # Replace the URL (last element) with the individual video URL
         single_cmd[-1] = vid_url
-        try:
-            p = subprocess.Popen(single_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            out, err = p.communicate(timeout=60)
-            if out and out.strip():
-                # Find first valid JSON line (skip any warning/debug prefix lines)
-                for ln in out.splitlines():
-                    ln = ln.strip()
-                    if ln.startswith('{'):
-                        try:
-                            return json.loads(ln)
-                        except Exception:
-                            continue
-        except Exception:
-            pass
+        rc, out, err = _run_proc(single_cmd, timeout=60)
+        if rc != 0 and is_yt:
+            fallback_single_cmd = _build_cmd(vid_url, fallback_client=True, no_playlist=True)
+            rc, out, err = _run_proc(fallback_single_cmd, timeout=60)
+
+        if out and out.strip():
+            for ln in out.splitlines():
+                ln = ln.strip()
+                if ln.startswith('{'):
+                    try:
+                        return json.loads(ln)
+                    except Exception:
+                        continue
         return None
 
     # Fetch concurrently — capped at 3 workers to avoid rate-limiting
@@ -353,17 +460,21 @@ def extract_media(url: str, default_resolution: str = "Best Quality"):
         for i, data in enumerate(results):
             if data:
                 item_formats = {}
+                audio_formats = {}
                 best_url = None
                 best_audio_url = None
                 best_ext = "mp4"
                 best_res = None
-                item_title = "Video"
-                item_thumb = ""
+                item_title = data.get("title", "Video")
+                item_thumb = data.get("thumbnail", "")
+                http_headers = data.get("http_headers") or {}
 
                 for res in resolutions_to_check:
                     media_url, audio_url, ext, title, thumb = process_single_media(data, res)
                     if media_url:
                         item_formats[res] = media_url
+                        if audio_url:
+                            audio_formats[res] = audio_url
                         if res == default_resolution or (best_url is None and res != "Audio Only"):
                             best_url = media_url
                             best_audio_url = audio_url
@@ -387,7 +498,9 @@ def extract_media(url: str, default_resolution: str = "Best Quality"):
                             "ext": best_ext,
                             "resolution": best_res,
                             "formats": item_formats,
-                            "thumbnail": item_thumb
+                            "audioFormats": audio_formats,
+                            "thumbnail": item_thumb,
+                            "httpHeaders": http_headers
                         }
                         if best_audio_url:
                             chunk["audioUrl"] = best_audio_url
@@ -399,7 +512,9 @@ def extract_media(url: str, default_resolution: str = "Best Quality"):
                             "ext": best_ext,
                             "resolution": best_res,
                             "formats": item_formats,
-                            "thumbnail": item_thumb
+                            "audioFormats": audio_formats,
+                            "thumbnail": item_thumb,
+                            "httpHeaders": http_headers
                         }
                         if best_audio_url:
                             playlist_item["audioUrl"] = best_audio_url
@@ -414,6 +529,14 @@ def extract_media(url: str, default_resolution: str = "Best Quality"):
     return {
         "status": "success",
         "title": parsed_items[0]["title"],
+        "url": parsed_items[0]["url"],
+        "audioUrl": parsed_items[0].get("audioUrl"),
+        "ext": parsed_items[0]["ext"],
+        "resolution": parsed_items[0]["resolution"],
+        "formats": parsed_items[0]["formats"],
+        "audioFormats": parsed_items[0].get("audioFormats", {}),
+        "thumbnail": parsed_items[0]["thumbnail"],
+        "httpHeaders": parsed_items[0].get("httpHeaders", {}),
         "playlist": parsed_items
     }
 

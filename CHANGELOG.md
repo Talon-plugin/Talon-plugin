@@ -2,6 +2,16 @@
 
 All notable changes to the **Talons** universal media extractor plugin are documented in this file.
 
+## [1.0.2] - 2026-10-01
+
+### Fixed
+- **YouTube Multi-Resolution Stream Extraction**: Removed `player_skip=configs,webpage` and adopted `default,web,ios` client tiers. This allows `yt-dlp` to download player JavaScript configs and decipher `n`-token signatures, unlocking all adaptive high-definition video tiers (`1080p`, `720p`, `480p`, etc.) rather than collapsing exclusively to legacy 360p muxed video.
+- **YouTube Extraction Resilience & Bot Gate Bypass**: Enhanced `yt-dlp` arguments with multi-client fallbacks (`default,web,ios` and `tv,mweb`) and automatic fallback execution retry to prevent PoToken and "Sign in to confirm you're not a bot" failures.
+- **YouTube Download 403 Forbidden Prevention**: Extracted and emitted `httpHeaders` from yt-dlp stream metadata, enabling downstream download engines to send matching browser `User-Agent` and headers to `googlevideo.com`.
+- **Audio Track Preservation Across Resolutions**: Emitted per-resolution `audioFormats` mapping so switching between video tiers (e.g., 720p to 1080p or 4K) dynamically preserves and attaches the required audio stream URL, preventing silent video downloads.
+- **Single Video Fast Path**: Added direct single-video extraction path that avoids running yt-dlp twice, cutting YouTube extraction latency by ~50% and preventing YouTube rate limits.
+- **Robust Ffmpeg Path & Container Merge**: Resolved `ffmpeg` executable lookup across standard macOS locations (`/opt/homebrew/bin`, `/usr/local/bin`) and added `-strict -2` support in `pincer-engine` with container preservation.
+
 ## [1.0.1] - 2026-10-01
 
 ### Fixed
