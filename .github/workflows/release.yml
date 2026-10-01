@@ -21,20 +21,20 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
       - name: Update plugin.json Version
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           sed -i '' "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" plugin/plugin.json
 
-      - name: Fetch Fresh Upstream yt-dlp
-        run: |
-          chmod +x build/fetch-ytdlp.sh
-          ./build/fetch-ytdlp.sh
-
       - name: Build Talons Plugin
         run: |
-          chmod +x build/build.sh
-          ./build/build.sh
+          chmod +x scripts/*.sh plugin/*.sh plugin/*.py
+          ./scripts/make.sh
 
       - name: Get Version
         id: get_version

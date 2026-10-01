@@ -20,19 +20,19 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
       - name: Verify Python Syntax
         run: |
           python3 -m py_compile plugin/extractor.py
 
-      - name: Fetch Upstream yt-dlp
+      - name: Build Talons Plugin
         run: |
-          chmod +x build/fetch-ytdlp.sh
-          ./build/fetch-ytdlp.sh
-
-      - name: Validate Plugin Build
-        run: |
-          chmod +x build/build.sh
-          ./build/build.sh
+          chmod +x scripts/*.sh plugin/*.sh plugin/*.py
+          ./scripts/make.sh
 
       - name: Verify Build Artifact Exists
         run: |

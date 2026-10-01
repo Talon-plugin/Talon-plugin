@@ -22,7 +22,8 @@ fi
 # Ensure executable permissions
 chmod +x "$PLUGIN_DIR/run.sh" "$PLUGIN_DIR/extractor.py"
 
-# Remove previous build if exists
+# Ensure output directory exists and remove previous build if exists
+mkdir -p "$REPO_ROOT/build"
 rm -f "$OUT_FILE"
 
 # Package plugin directory contents into .gda archive
