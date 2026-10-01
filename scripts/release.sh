@@ -13,7 +13,7 @@ if [ -z "$1" ]; then
     exit 1
 fi
 
-# Extract the version without the 'v' prefix if the user included it (e.g., v1.0.0 -> 1.0.0)
+# Extract the version without the 'v' prefix if we included it (e.g., v1.0.0 -> 1.0.0)
 RAW_VERSION=${1#v}
 NEW_VERSION=$RAW_VERSION
 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
@@ -26,7 +26,7 @@ chmod +x build/*.sh plugin/*.sh plugin/*.py scripts/*.sh 2>/dev/null || true
 
 # 3. Validate build locally
 echo "🔨 Building release locally to validate..."
-./build/build.sh
+./scripts/make.sh
 
 # 4. Create git tag
 echo "🏷️ Creating git tag v$NEW_VERSION..."
@@ -37,4 +37,4 @@ echo "✅ Talons release v$NEW_VERSION is ready!"
 echo "☁️ To complete the release, push the tag to GitHub:"
 echo "  git push origin \"v$NEW_VERSION\""
 echo ""
-echo "✅ Once pushed, GitHub Actions will fetch fresh upstream yt-dlp, package talons.gda, and publish the release automatically."
+echo "✅ Once pushed, GitHub Actions will package talons.gda using uv and publish the release automatically."

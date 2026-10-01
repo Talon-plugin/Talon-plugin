@@ -1,0 +1,9 @@
+[project]
+name = "talons"
+version = "1.0.0"
+description = "Talons — Universal Media Extractor Plugin for Grabbit"
+requires-python = ">=3.10"
+dependencies = [
+    "yt-dlp>=2026.1.1",
+]
+

@@ -72,7 +72,7 @@ git clone https://github.com/grabbit/grabbit-ytdlp-plugin.git
 cd grabbit-ytdlp-plugin
 
 # 2. Build the talons.gda package
-./build/build.sh
+./scripts/make.sh
 ```
 The packaged `talons.gda` plugin bundle will be generated in `build/talons.gda`.
 
@@ -91,9 +91,8 @@ git push origin v1.0.0
 ```
 
 Once the tag is pushed, GitHub Actions will:
-1. Fetch fresh upstream `yt-dlp` code directly from GitHub.
-2. Package `talons.gda`.
-3. Create the GitHub Release and attach `talons.gda` automatically to the Releases tab.
+1. Package `talons.gda` using `uv`.
+2. Create the GitHub Release and attach `talons.gda` automatically to the Releases tab.
 
 ---
 
@@ -106,16 +105,15 @@ grabbit-ytdlp-plugin/
 │       ├── ci.yml               # CI build & verification on push/PR
 │       └── release.yml          # Auto Release workflow triggered on tag push
 ├── build/
-│   ├── build.sh                 # Packaging script -> build/talons.gda
-│   └── fetch-ytdlp.sh           # Fetches latest upstream yt-dlp from GitHub
+│   └── talons.gda               # Packaged plugin artifact
+├── scripts/
+│   ├── make.sh                  # Packaging script
+│   └── release.sh               # Release tagging script
 ├── plugin/
 │   ├── icon.svg                 # Branded Talons vector icon
 │   ├── plugin.json              # Grabbit plugin manifest
 │   ├── run.sh                   # Unix runner entrypoint
-│   ├── extractor.py             # Stream filtering and metadata extraction engine
-│   └── yt-dlp/                  # Bundled upstream yt_dlp Python package
-├── scripts/
-│   └── release.sh               # Standardized release script (mirrors pincer-engine)
+│   └── extractor.py             # Stream filtering and metadata extraction engine
 ├── .gitignore                   # Git hygiene & artifact exclusions
 ├── LICENSE                      # MIT License
 └── README.md                    # Project documentation
@@ -127,7 +125,7 @@ grabbit-ytdlp-plugin/
 
 - **Python Not Found**: Ensure Python 3 is installed and available in PATH (`which python3` or `brew install python`).
 - **Site-Specific DRM or Captchas**: Some sites may require browser cookies. Ensure your Grabbit settings allow cookie access if required.
-- **Updating Extractors**: Run `./build/fetch-ytdlp.sh` to refresh the embedded `yt-dlp` package whenever video sites update their player algorithms.
+- **Updating Extractors**: Run `uv lock --upgrade-package yt-dlp` from the `plugin/` directory to refresh the yt-dlp version whenever video sites update their player algorithms.
 
 ---
 

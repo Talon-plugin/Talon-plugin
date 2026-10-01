@@ -5,6 +5,11 @@ import json
 import subprocess
 import re
 
+
+# ---------------------------------------------------------------------------
+# Filename sanitization
+# ---------------------------------------------------------------------------
+
 def sanitize_filename(title: str, ext: str) -> str:
     clean = re.sub(r'[/\\?%*:|"<>!]', '-', title).strip()
     clean = re.sub(r'\s+', ' ', clean)
@@ -14,6 +19,11 @@ def sanitize_filename(title: str, ext: str) -> str:
     if clean.lower().endswith(f".{clean_ext}"):
         return clean
     return f"{clean}.{clean_ext}"
+
+
+# ---------------------------------------------------------------------------
+# Format selection
+# ---------------------------------------------------------------------------
 
 def process_single_media(data, resolution: str):
     title = data.get("title", "Video")
@@ -106,7 +116,7 @@ def process_single_media(data, resolution: str):
         if requested_height:
             under_or_equal = [f for f in video_formats if parse_height(f) <= requested_height]
             pool = under_or_equal if under_or_equal else video_formats
-            
+
             def height_sort_key(f):
                 h = parse_height(f)
                 has_audio = 1 if str(f.get("acodec", "none")).lower() not in ["none", ""] else 0
@@ -132,7 +142,7 @@ def process_single_media(data, resolution: str):
 
     media_url = chosen_format.get("url")
     audio_url = None
-    
+
     if not is_audio_only:
         has_audio = str(chosen_format.get("acodec", "none")).lower() not in ["none", ""]
         if not has_audio:
@@ -150,61 +160,81 @@ def process_single_media(data, resolution: str):
 
     return media_url, audio_url, chosen_ext, title, thumbnail
 
-def extract_media(url: str, default_resolution: str = "Best Quality"):
-    plugin_dir = os.path.dirname(os.path.abspath(__file__))
-    ytdlp_dir = os.path.join(plugin_dir, "yt-dlp")
-    ytdlp_bin = os.path.join(plugin_dir, "yt-dlp")
-    
-    env = os.environ.copy()
-    if os.path.isdir(ytdlp_dir):
-        env["PYTHONPATH"] = f"{ytdlp_dir}:{env.get('PYTHONPATH', '')}"
-        cmd = [
-            sys.executable or "python3",
-            "-m",
-            "yt_dlp",
-            "--no-warnings",
-            "-q",
-            "--dump-json",
-            "--yes-playlist",
-            "--",
-            url
-        ]
-    elif os.path.isfile(ytdlp_bin) and os.access(ytdlp_bin, os.X_OK):
-        cmd = [
-            ytdlp_bin,
-            "--no-warnings",
-            "-q",
-            "--dump-json",
-            "--yes-playlist",
-            "--",
-            url
-        ]
-    else:
-        cmd = [
-            sys.executable or "python3",
-            "-m",
-            "yt_dlp",
-            "--no-warnings",
-            "-q",
-            "--dump-json",
-            "--yes-playlist",
-            "--",
-            url
-        ]
 
-    import concurrent.futures
+# ---------------------------------------------------------------------------
+# Build yt-dlp command
+# ---------------------------------------------------------------------------
 
+# YouTube PoToken workaround: use the Android client which bypasses the
+# Proof-of-Origin (PoToken) gate that blocks web/ios clients for unauthenticated
+# users. Confirmed working with yt-dlp 2026.08.x on macOS without cookies.
+_YOUTUBE_EXTRACTOR_ARGS = [
+    "--extractor-args", "youtube:player_client=default,android",
+]
+
+
+def _build_cmd(url: str) -> list:
+    """Return the base yt-dlp command list for fetching full JSON info.
+
+    uv run (called from run.sh) installs yt-dlp into the venv declared in
+    pyproject.toml and sets sys.executable to that venv's Python — so we
+    simply invoke `sys.executable -m yt_dlp` here, no path detection needed.
+    """
+    base_flags = [
+        "--no-warnings",
+        "-q",
+        "--dump-json",
+        "--yes-playlist",
+    ]
+
+    # YouTube PoToken workaround: android client bypasses the sign-in gate
+    yt_flags = []
+    if re.search(r"(youtube\.com|youtu\.be)", url, re.I):
+        yt_flags = _YOUTUBE_EXTRACTOR_ARGS
+
+    return [sys.executable, "-m", "yt_dlp"] + base_flags + yt_flags + ["--", url]
+
+
+def _build_flat_cmd(cmd: list) -> list:
+    """Convert a full-JSON command into a flat-playlist / dump-single-json command."""
     flat_cmd = cmd.copy()
+
+    # Remove --dump-json
     if "--dump-json" in flat_cmd:
         flat_cmd.remove("--dump-json")
+
+    # Replace --yes-playlist with --flat-playlist
     if "--yes-playlist" in flat_cmd:
         idx = flat_cmd.index("--yes-playlist")
         flat_cmd[idx] = "--flat-playlist"
-    flat_cmd.insert(-2, "--dump-single-json")
+
+    # Insert --dump-single-json immediately before the "--" URL separator
+    # Correct order: ... --flat-playlist --dump-single-json -- <url>
+    if "--" in flat_cmd:
+        sep_idx = flat_cmd.index("--")
+        flat_cmd.insert(sep_idx, "--dump-single-json")
+    else:
+        flat_cmd.insert(-1, "--dump-single-json")
+
+    return flat_cmd
+
+
+# ---------------------------------------------------------------------------
+# Main extraction logic
+# ---------------------------------------------------------------------------
+
+def extract_media(url: str, default_resolution: str = "Best Quality"):
+    cmd = _build_cmd(url)
+    flat_cmd = _build_flat_cmd(cmd)
+
+    import concurrent.futures
 
     try:
-        proc = subprocess.Popen(flat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
-        stdout, stderr = proc.communicate()
+        proc = subprocess.Popen(flat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout, stderr = proc.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return {"status": "error", "message": "yt-dlp timed out while fetching playlist info"}
     except Exception as e:
         return {"status": "error", "message": f"Failed to execute yt-dlp: {str(e)}"}
 
@@ -221,18 +251,21 @@ def extract_media(url: str, default_resolution: str = "Best Quality"):
             continue
         try:
             metadata = json.loads(line)
-            
-            # Extract playlist title from the first item if available
+
             if not playlist_title and metadata.get("playlist_title"):
                 playlist_title = metadata.get("playlist_title")
 
             if metadata.get("_type") == "playlist":
                 for entry in metadata.get("entries", []):
-                    u = entry.get("url") or entry.get("webpage_url")
+                    # Prefer webpage_url (proper watch URL) over raw CDN url
+                    u = entry.get("webpage_url") or entry.get("url")
                     if u:
                         urls_to_fetch.append(u)
             else:
-                u = metadata.get("url") or metadata.get("webpage_url")
+                # For single videos: webpage_url is the canonical watch URL.
+                # metadata.get("url") may be a signed CDN stream URL that
+                # yt-dlp cannot re-fetch info for.
+                u = metadata.get("webpage_url") or metadata.get("url")
                 if u:
                     urls_to_fetch.append(u)
         except Exception:
@@ -240,27 +273,35 @@ def extract_media(url: str, default_resolution: str = "Best Quality"):
 
     if not urls_to_fetch:
         return {"status": "error", "message": "No playable URLs found in playlist"}
-        
+
     urls_to_fetch = list(dict.fromkeys(urls_to_fetch))
     is_playlist_mode = len(urls_to_fetch) > 1
-    
+
     if is_playlist_mode:
         final_title = playlist_title if playlist_title else "Playlist"
         print(json.dumps({"type": "header", "total": len(urls_to_fetch), "playlist_title": final_title}), flush=True)
 
     parsed_items = []
-    resolutions_to_check = ["Best Quality", "1080p", "720p", "480p", "Audio Only"]
+    resolutions_to_check = ["Best Quality", "4K", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p", "Audio Only"]
 
     def fetch_single(vid_url):
         single_cmd = cmd.copy()
         if "--yes-playlist" in single_cmd:
             single_cmd[single_cmd.index("--yes-playlist")] = "--no-playlist"
+        # Replace the URL (last element) with the individual video URL
         single_cmd[-1] = vid_url
         try:
-            p = subprocess.Popen(single_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
-            out, _ = p.communicate(timeout=45)
-            if out and out.strip().startswith('{'):
-                return json.loads(out)
+            p = subprocess.Popen(single_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            out, err = p.communicate(timeout=60)
+            if out and out.strip():
+                # Find first valid JSON line (skip any warning/debug prefix lines)
+                for ln in out.splitlines():
+                    ln = ln.strip()
+                    if ln.startswith('{'):
+                        try:
+                            return json.loads(ln)
+                        except Exception:
+                            continue
         except Exception:
             pass
         return None
@@ -287,7 +328,7 @@ def extract_media(url: str, default_resolution: str = "Best Quality"):
                             best_ext = ext
                             item_title = title
                             item_thumb = thumb
-                
+
                 if best_url:
                     if is_playlist_mode:
                         chunk = {
@@ -315,7 +356,6 @@ def extract_media(url: str, default_resolution: str = "Best Quality"):
                         parsed_items.append(playlist_item)
 
     if is_playlist_mode:
-        # We already streamed all output directly to stdout for Grabbit to parse
         sys.exit(0)
 
     if not parsed_items:
@@ -327,6 +367,7 @@ def extract_media(url: str, default_resolution: str = "Best Quality"):
         "playlist": parsed_items
     }
 
+
 def main():
     if len(sys.argv) < 2:
         print(json.dumps({"status": "error", "message": "Usage: extractor.py <url> [resolution]"}))
@@ -337,6 +378,7 @@ def main():
 
     result = extract_media(url, resolution)
     print(json.dumps(result, ensure_ascii=False))
+
 
 if __name__ == "__main__":
     main()
